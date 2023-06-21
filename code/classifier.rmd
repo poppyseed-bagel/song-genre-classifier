@@ -1,0 +1,833 @@
+---
+title: "Problem Set 4 Benchmark Classifier"
+date: |
+  | `r format(Sys.time(), '%d %B %Y')`
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+set.seed(1)
+library(randomGLM)
+library(glmnet)
+library(caret)
+library(data.table)
+library(tidyverse)
+library(randomForest)
+library(ggthemes)
+library(Metrics)
+library(tm)
+library(pROC) 
+library(tidytext)
+library(fastText)
+library(yardstick)
+library(h2o)
+library(wsrf)
+```
+
+
+```{r data_wrangling, message=FALSE, warning=FALSE}
+
+# Load Data
+#download.file('https://github.com/lse-my474/pset_data/raw/main/songs_test.csv', 'songs_test.csv')
+#download.file('https://github.com/lse-my474/pset_data/raw/main/songs_train.csv', 'songs_train.csv')
+
+songs_tr <- read.csv('songs_train.csv')
+songs_te <- read.csv('songs_test.csv')
+
+# Wrangle for compatibility
+songs_tr$sample <- rep('train', nrow(songs_tr))
+songs_te$sample <- rep('test', nrow(songs_te))
+songs_te$genre <- rep(NA, nrow(songs_te))
+
+# Create full df
+data <- rbind(songs_tr, songs_te)
+
+# Remove Duplicates across multiple classes
+dupesongs <- read_csv("dupesongs.csv")
+
+dupe_song_ids <- dupesongs %>%
+  select(song_id) %>%
+  as.vector() 
+
+dupe_song_ids <- dupe_song_ids[[1]]
+
+data <- data[!(data$song_id %in% dupe_song_ids), ]
+
+# Remove dupes from songs_tr for model training on outcome
+songs_tr <- songs_tr[!(songs_tr$song_id %in% dupe_song_ids), ]
+
+
+# Scale Data
+data_x_scaled <- data %>%
+  select(-song_id, -genre, -sample) %>%
+  scale()
+
+id_data <- data %>%
+  select(song_id, genre, sample) %>%
+  mutate(genre = as.factor(genre))
+
+all_data_scaled <- cbind(data_x_scaled, id_data)
+
+```
+
+
+# Create Pre-Feature Selection Train & Test (1) (Raw)
+```{r train_test_1 ,message=FALSE, warning=FALSE}
+
+# Split data into test and train sets
+test_x_scaled <- all_data_scaled %>%
+  filter(sample == 'test') %>%
+  select(-sample, -song_id, -genre) %>%
+  as.matrix()
+
+train_x_scaled <- all_data_scaled %>%
+  filter(sample == 'train') %>%
+  select(-sample, -song_id, -genre)
+
+```
+
+
+# LASSO 1 - With no prior feature selection
+
+__Used for both predictions and feature selection__
+
+_CV Error of 1.639_
+```{r lasso, message=FALSE, warning=FALSE}
+# Initial LASSO - Before pre-processing and feature selection 
+
+# lasso_cv <- cv.glmnet(x = train_x_scaled,
+#                    y = train_y,
+#                    family="multinomial",
+#                    alpha=1,
+#                    nfolds=10,
+#                    nlambda = 100)
+
+# saveRDS(lasso_cv, "lasso_model_1.rds")
+
+# Load pre-trained Lasso model
+lasso_cv <- readRDS("lasso_model_1.rds")
+
+# Plot lasso lambda values
+plot(lasso_cv)
+
+paste("The value of lambda that minimises CV error (MSE) is", lasso_cv$lambda.min, "at index", which.min(lasso_cv$cvm))
+
+paste("The value of lambda that is 1 standard deviation away from the optimum lambda value is", lasso_cv$lambda.1se)
+
+paste("The optimum CV error MSE is", lasso_cv$cvm[which(lasso_cv$lambda == lasso_cv$lambda.min)])
+
+# Predict on test data
+lasso_test_preds <- predict(lasso_cv, test_x_scaled, type = "class")
+
+table(lasso_test_preds)
+
+######## Feature Selection
+######## 2 choices - Optimum predictive lambda and Lambda 1SE 
+
+### First, 1 Standard Error Away from Optimum Lambda
+lasso_mod_1se <- as.numeric(which(lasso_cv$lambda==lasso_cv$lambda.1se))
+
+# Find betas for each genre
+beta_1se_hh <- lasso_cv$glmnet.fit$beta$`hip hop`[,lasso_mod_1se]
+beta_1se_pop <- lasso_cv$glmnet.fit$beta$pop[,lasso_mod_1se]
+beta_1se_rap <- lasso_cv$glmnet.fit$beta$rap[,lasso_mod_1se]
+beta_1se_rock <- lasso_cv$glmnet.fit$beta$rock[,lasso_mod_1se]
+
+beta_1se <- rbind(beta_1se_hh, beta_1se_pop, beta_1se_rap, beta_1se_rock)
+
+# Drop features that have beta == 0 for all genres
+beta_1se_t <- t(beta_1se) %>%
+  as.data.frame() %>%
+  mutate(avg_coef = (beta_1se_hh+beta_1se_pop+beta_1se_rap+beta_1se_rock)/4,
+         feat_selec = case_when(beta_1se_hh != 0 | beta_1se_pop != 0 | beta_1se_rap != 0 | beta_1se_rock != 0 ~ 'keep'))
+
+beta_1se_t$feat_selec[is.na(beta_1se_t$feat_selec) == TRUE] <- "remove"
+
+# Examine removed features
+lasso_betas_1se_remove <- beta_1se_t %>%
+  filter(feat_selec == "remove") %>%
+  t()
+
+lasso_betas_1se_remove <- colnames(lasso_betas_1se_remove)
+
+head(lasso_betas_1se_remove)
+
+
+## Second, Optimum Lambda for Prediction (lambda.min)
+
+lasso_mod_min <- which(lasso_cv$lambda==lasso_cv$lambda.min)
+
+beta_min_hh <- lasso_cv$glmnet.fit$beta$`hip hop`[,lasso_mod_min]
+beta_min_pop <- lasso_cv$glmnet.fit$beta$pop[,lasso_mod_min]
+beta_min_rap <- lasso_cv$glmnet.fit$beta$rap[,lasso_mod_min]
+beta_min_rock <- lasso_cv$glmnet.fit$beta$rock[,lasso_mod_min]
+
+beta_min <- rbind(beta_min_hh, beta_min_pop, beta_min_rap, beta_min_rock)
+
+beta_min_t <- t(beta_min) %>%
+  as.data.frame() %>%
+  mutate(avg_coef = (beta_min_hh+beta_min_pop+beta_min_rap+beta_min_rock)/4,
+         feat_selec = case_when(beta_min_hh != 0 | beta_min_pop != 0 | beta_min_rap != 0 | beta_min_rock != 0 ~ 'keep'))
+
+beta_min_t$feat_selec[is.na(beta_min_t$feat_selec) == TRUE] <- "remove"
+
+lasso_betas_min_remove <- beta_min_t %>%
+  filter(feat_selec == "remove") %>%
+  t()
+
+lasso_betas_min_remove <- colnames(lasso_betas_min_remove)
+
+head(lasso_betas_min_remove)
+
+# Summary Statistics
+
+paste("There are", length(lasso_betas_min_remove), "features with a 0 coefficient across all four genres for the model with a lambda value that minimises RMSE")
+
+paste("There are", length(lasso_betas_1se_remove), "features with a 0 coefficient across all four genres for the model with a lambda value that is 1 standard error away from the lambda that minimises RMSE")
+
+```
+
+
+# TFIDF Feature Selection
+
+```{r tfidf, message=FALSE, warning=FALSE}
+
+words_count <- data %>%
+  gather(word, binary, -song_id) %>%
+  filter(binary == 1) %>%
+  count(song_id, word, sort = TRUE) %>%
+  ungroup()
+
+# Creating sum of all words per ID
+total_words <- words_count %>%
+  group_by(song_id) %>%
+  summarize(total = sum(n))
+
+# Joining total sum with word count
+ID_words <- left_join(words_count, total_words)
+
+# Adding IDF to ID_words
+ID_words <- ID_words %>%
+  bind_tf_idf(word, song_id, n)
+
+head(ID_words)
+
+# Determining the most relevant words MEAN
+word_tfidf_mean <- ID_words[, c('word', 'tf_idf')] %>%
+  group_by(word) %>%
+  summarise(tf_idf_mean = mean(tf_idf)) %>%
+  arrange(desc(tf_idf_mean))
+
+head(word_tfidf_mean)
+
+# Plotting histogram of TFIDF values
+ggplot(word_tfidf_mean, aes(x = tf_idf_mean)) +
+  geom_histogram(binwidth = 0.01, fill = 'blue') +
+  scale_x_continuous(breaks = seq(-1, 1, by = 0.2)) +
+  ggtitle('Count of TF_IDF Column Means') +
+  xlab('Column Mean') +
+  ylab('Count') +
+  theme(plot.title = element_text(hjust = 0.5))
+
+# Lowest and highest occurring words
+high_low <- rbind(head(word_tfidf_mean), tail(word_tfidf_mean))
+high_low
+
+```
+
+
+# Random Forest 1 (Random Search, pre-feature engineering)
+
+__Used for both predictions and variable importance__
+
+_Max CV Accuracy of 0.675_
+```{r randomforest_1, message=FALSE, warning=FALSE}
+
+# Optimise Hyperparameter tuning for RF Model
+
+#ntree = 500 due to https://arxiv.org/pdf/0811.3619.pdf
+
+# Set up grid for grid search
+tune_grid <- expand.grid(.mtry = c(15, 20, 25, 30, 35, 40, 45, 50, 55, 60, 65, 70, 75))
+
+control <- trainControl(method = "cv",
+                        number = 3,
+                        search = 'random'
+                        )
+
+# rf_randomsearch_1 <- train(x = train_x,
+#                        y = train_y,
+#                        method = 'rf',
+#                        metric = "Accuracy",
+#                        tuneLength = 20,
+#                        tuneGrid = tune_grid
+#                        trControl = control
+#                        )
+
+# saveRDS(rf_randomsearch, "rf_model_1.rds")
+
+rf_randomsearch_1 <- readRDS("rf_model_1.rds")
+
+plot(rf_randomsearch_1)
+
+paste("The optimum number of randomly selected variables per tree is", rf_randomsearch_1$bestTune)
+
+paste("The highest CV Accuracy for our first Random Forest model is", max(rf_randomsearch_1$results$Accuracy))
+
+## Variable Importance
+rf_varimp <- varImp(rf_randomsearch_1)
+
+rf_varimp <- rf_varimp$importance
+
+# For feature selection
+low_varimp_rf_0 <- rf_varimp %>%
+  filter(Overall == 0)
+
+low_varimp_rf_1 <- rf_varimp %>%
+  filter(Overall < 1)
+
+paste("The variables with a 0 'variable importance' score, according to our Random Forest model, are called:", rownames(low_varimp_rf_0))
+
+paste("There are", nrow(low_varimp_rf_1), "variables with a 'variable importance' score less than 1, according to our Random Forest model.")
+
+# For data visualization
+high_varimp_rf_10 <- rf_varimp %>%
+  filter(Overall > 10) 
+
+high_varimp_rf_10 <- high_varimp_rf_10 %>%
+  mutate(feature_name = rownames(high_varimp_rf_10))
+  
+high_varimp_rf_10 %>%
+  arrange(desc(Overall)) %>%
+  ggplot(aes(x = Overall, y = feature_name)) +
+  geom_col(colour = "black", fill = "red") +
+  labs(title = "Top Features by Mean Decrease in Gini Score", 
+       subtitle = "Top audio features dominate variable importance") +
+  xlab("Mean Decrease in Gini Score upon Removal") +
+  ylab("Feature Name") +
+  theme_tufte()
+
+## Predicting Values out-of-sample
+
+rf_test_preds <- predict(rf_randomsearch_1, test_x_scaled, type = "prob")
+
+rf_test_preds <- colnames(rf_test_preds)[max.col(rf_test_preds)]
+
+```
+
+
+# Feature Selection w/ LASSO
+
+```{r feature_selection, message=FALSE, warning=FALSE}
+
+# Remove features from LASSO feature selection 
+data_fs_1se <- all_data_scaled[, !names(all_data_scaled) %in% lasso_betas_1se_remove]
+
+paste("There are", ncol(all_data_scaled) - 3, "features in the data set before removal of columns from the LASSO process")
+
+paste("There are", ncol(data_fs_1se) - 3, "features in the data set after the removal of columns from the LASSO process")
+
+```
+
+
+#  Train/Test Split (2) 
+
+```{r train_test_2, message=FALSE, warning=FALSE}
+
+# Split feature selected data into test and train sets
+
+test_x_scaled <- data_fs_1se %>%
+  filter(sample == 'test') %>%
+  select(-sample, -song_id, -genre) %>%
+  as.matrix()
+
+train_x_scaled <- data_fs_1se %>%
+  filter(sample == 'train') %>%
+  select(-sample, -song_id, -genre)
+
+```
+
+
+# Random Forest 2 - (Gridsearch w/ LASSO feature removal)
+__We use the random search to derive information on the optimum 'zone' for hyperparameter optimisation. The results of the random search are able to inform the following model, which we tune using grid search.__
+
+_Max CV Accuracy of 0.676_
+
+```{r randomforest_2, message=FALSE, warning=FALSE}
+# Training Model
+control <- trainControl(method = "cv",
+                        number = 3,
+                        search = 'grid'
+                        )
+
+# Set up grid for grid search
+tune_grid <- expand.grid(.mtry = c(15, 20, 25, 30, 35, 40, 45, 50, 55, 60, 65, 70, 75))
+
+# rf_gridsearch_2 <- train(x = train_x_scaled,
+#                        y = as.factor(songs_tr$genre),
+#                         method = 'rf',
+#                         metric = "Accuracy",
+#                         tuneGrid = tune_grid,
+#                         trControl = control
+#                         )
+
+
+# saveRDS(rf_gridsearch_2, "rf_model_2.rds")
+
+rf_gridsearch_2 <- readRDS("rf_model_2.rds")
+
+# Summarising Model
+
+plot(rf_gridsearch_2)
+
+paste("The optimum number of randomly selected variables per tree is", rf_gridsearch_2$bestTune)
+
+paste("The highest CV Accuracy for our second Random Forest model is", max(rf_gridsearch_2$results$Accuracy))
+
+## Variable Importance
+
+rf_varimp_2 <- varImp(rf_gridsearch_2)
+
+rf_varimp_2 <- rf_varimp_2$importance
+
+# For feature selection
+low_varimp_rf_0 <- rf_varimp_2 %>%
+  filter(Overall == 0)
+
+low_varimp_rf_1 <- rf_varimp_2 %>%
+  filter(Overall < 1)
+
+paste("The variables with a 0 'variable importance' score, according to our Random Forest model, are called:", rownames(low_varimp_rf_0))
+
+paste("There are", nrow(low_varimp_rf_1), "variables with a 'variable importance' score less than 1, according to our Random Forest model.")
+
+# For data visualization
+high_varimp_rf_10 <- rf_varimp_2 %>%
+  filter(Overall > 10) 
+
+high_varimp_rf_10 <- high_varimp_rf_10 %>%
+  mutate(feature_name = rownames(high_varimp_rf_10))
+  
+high_varimp_rf_10 %>%
+  arrange(desc(Overall)) %>%
+  ggplot(aes(x = Overall, y = feature_name)) +
+  geom_col(colour = "black", fill = "red") +
+  labs(title = "Top Features by Mean Decrease in Gini Score", 
+       subtitle = "Top audio features dominate variable importance") +
+  xlab("Mean Decrease in Gini Score upon Removal") +
+  ylab("Feature Name") +
+  theme_tufte()
+
+## Predicting Values out-of-sample
+
+rf_test_preds_2 <- predict(rf_gridsearch_2, test_x_scaled, type = "prob")
+
+rf_test_preds_2 <- colnames(rf_test_preds_2)[max.col(rf_test_preds_2)]
+
+```
+
+
+# Feature Selection Using Random Forests
+
+```{r rf_feature_selection, message=FALSE, warning=FALSE}
+
+# Remove Features with Variable Importance = 0
+
+varimp_0 <- rownames(low_varimp_rf_0)
+
+data_fs_rf <- data_fs_1se[, !names(data_fs_1se) %in% varimp_0]
+
+```
+
+
+# Feature Creation
+```{r feature_creation, message=FALSE, warning=FALSE}
+
+# 1. Trying to Identify Languages using Automated Packages for Feature Selection
+
+feature_names <- substr(names(train_x_scaled), 7, nchar(names(train_x_scaled))) 
+
+feature_names <- gsub("_","", feature_names)
+
+feature_languages <- cbind(feature_names,language_identification(feature_names, 
+                        "lid.176.ftz",
+                        k = 2
+                        )) 
+
+# Poor language detection for words that aren't "formal." For example, thug is categorised as 'catalan.'
+# And even word such as 'message' are misclassified as AZ.
+
+# write.csv(feature_names, "feature_names.csv", row.names=FALSE)
+
+# We then manually went through all of the words and allocated binary values across a number of categories
+# Spanish, AAVE, Non_Word, Swear_Word, Drug_ref, structure, likely_rap, likely_hh
+# The method for feature creation is discussed in detail in the writeup
+
+# Load feature_names back in, skip header line.
+feature_names <- read_csv("feature_names_3.csv", skip = 1)
+
+# feature_names <- feature_names[,1:6]
+
+# Convert NA values to 0 
+feature_names[is.na(feature_names) == TRUE] <- 0
+
+# Create vectors of features
+
+# Spanish
+spanish_lyric_features <- feature_names %>%
+  filter(Spanish == 1) %>%
+  select(x) %>%
+  as.vector()
+
+spanish_lyric_features <- spanish_lyric_features[[1]]
+
+spanish_lyric_features <- paste("lyrics_", spanish_lyric_features, sep = "")
+
+# AAVE
+AAVE_lyric_features <- feature_names %>%
+  filter(AAVE == 1) %>%
+  select(x) %>%
+  as.vector()
+
+AAVE_lyric_features <- AAVE_lyric_features[[1]]
+
+AAVE_lyric_features <- paste("lyrics_", AAVE_lyric_features, sep = "")
+
+# Non-words
+NW_lyric_features <- feature_names %>%
+  filter(Non_Word == 1) %>%
+  select(x) %>%
+  as.vector()
+
+NW_lyric_features <- NW_lyric_features[[1]]
+
+NW_lyric_features <- paste("lyrics_", NW_lyric_features, sep = "")
+
+# Swear Words
+Swear_lyric_features <- feature_names %>%
+  filter(Swear_word == 1) %>%
+  select(x) %>%
+  as.vector()
+
+Swear_lyric_features <- Swear_lyric_features[[1]]
+
+Swear_lyric_features <- paste("lyrics_", Swear_lyric_features, sep = "")
+
+# Drug References
+Drug_lyric_features <- feature_names %>%
+  filter(Drug_ref == 1) %>%
+  select(x) %>%
+  as.vector()
+
+Drug_lyric_features <- Drug_lyric_features[[1]]
+
+Drug_lyric_features <- paste("lyrics_", Drug_lyric_features, sep = "")
+
+# Structure
+
+Structure_features <- feature_names %>%
+  filter(Structure == 1) %>%
+  select(x) %>%
+  as.vector()
+
+Structure_features <- Structure_features[[1]]
+
+Structure_features <- paste("lyrics_", Structure_features, sep = "")
+
+# Likely rap
+
+likely_rap_features <- feature_names %>%
+  filter(likely_rap == 1) %>%
+  select(x) %>%
+  as.vector()
+
+likely_rap_features <- likely_rap_features[[1]]
+
+likely_rap_features <- paste("lyrics_", likely_rap_features, sep = "")
+
+# Likely hiphop
+
+likely_hh_features <- feature_names %>%
+  filter(likely_hiphop == 1) %>%
+  select(x) %>%
+  as.vector()
+
+likely_hh_features <- likely_hh_features[[1]]
+
+likely_hh_features <- paste("lyrics_", likely_hh_features, sep = "")
+
+# Create Columns in DF 
+
+data_fs_rf_sub <- subset(data_fs_rf, select = -c(sample, genre, song_id))
+
+data_fs_rf$Spanish <- ifelse(apply(data_fs_rf_sub[,spanish_lyric_features], MARGIN = 1, FUN = max) > 0, 1, 0)
+
+data_fs_rf$AAVE <- ifelse(apply(data_fs_rf_sub[,AAVE_lyric_features], MARGIN = 1, FUN = max) > 0, 1, 0)
+
+data_fs_rf$Non_word <- ifelse(apply(data_fs_rf_sub[,NW_lyric_features], MARGIN = 1, FUN = max) > 0, 1, 0)
+
+data_fs_rf$Swear_word <- ifelse(apply(data_fs_rf_sub[,Swear_lyric_features], MARGIN = 1, FUN = max) > 0, 1, 0)
+
+data_fs_rf$Drug_ref <- ifelse(apply(data_fs_rf_sub[,Drug_lyric_features], MARGIN = 1, FUN = max) > 0, 1, 0)
+
+data_fs_rf$likely_rap <- ifelse(rowSums(data_fs_rf[,likely_rap_features]) > 0, 1, 0)
+
+data_fs_rf$likely_hh <- ifelse(rowSums(data_fs_rf[,likely_hh_features]) > 0, 1, 0)
+
+# write.csv(data_fs_rf, "full_data.csv", row.names=FALSE)
+
+```
+
+
+#  Train/Test Split (3) 
+```{r train_test_3,  message=FALSE, warning=FALSE}
+
+# Split feature selected AND feature created data into test and train sets
+
+test_x_scaled <- data_fs_rf %>%
+  filter(sample == 'test') %>%
+  select(-sample, -song_id, -genre) %>%
+  as.matrix()
+
+# write.csv(test_x_scaled, "test_data.csv", row.names=FALSE)
+
+train_x_scaled <- data_fs_rf %>%
+  filter(sample == 'train') %>%
+  select(-sample, -song_id, -genre)
+
+# write.csv(train_x_scaled, "train_data.csv", row.names=FALSE)
+
+```
+
+
+# Random Forest 3 (With expanded CV, Feature Creation & Feature Selection)
+
+_Max CV Accuracy of 0.678_
+_Max CV Accuracy of 0.733_
+```{r randomforest_3,  message=FALSE, warning=FALSE}
+# This model was before the addition of the strucutre, likely_rap, and likely_hh variables
+
+# Training Model
+control <- trainControl(method = "cv",
+                        number = 8,
+                        search = 'grid'
+                        )
+
+tune_grid <- expand.grid(.mtry = c(15, 20, 25, 30, 35, 40))
+
+# rf_gridsearch_3 <- train(x = train_x_scaled,
+#                          y = as.factor(songs_tr$genre),
+#                          method = 'rf',
+#                          metric = "Accuracy",
+#                         tuneGrid = tune_grid,
+#                         trControl = control
+#                          )
+
+# saveRDS(rf_gridsearch_3, "rf_model_3.rds")
+
+# Set up grid for grid search
+
+rf_gridsearch_3 <- readRDS("rf_model_3.rds")
+
+# Summarising Model
+
+plot(rf_gridsearch_3)
+
+paste("The optimum number of randomly selected variables per tree is", rf_gridsearch_3$bestTune)
+
+paste("The highest CV Accuracy for our third Random Forest model is", max(rf_gridsearch_3$results$Accuracy))
+
+rf_test_preds_3 <- predict(rf_gridsearch_3, test_x_scaled, type = "prob")
+
+rf_test_preds_3 <- colnames(rf_gridsearch_3)[max.col(rf_test_preds_3)]
+
+```
+
+
+# Random Forest 4 (With expanded CV, Revised Feature Creation & Feature Selection)
+
+_Max CV Accuracy of 0.677_
+```{r randomforest_4, message=FALSE, warning=FALSE}
+# This model was after the addition of the strucutre, likely_rap, and likely_hh variables
+
+# Training Model
+control <- trainControl(method = "cv",
+                        number = 3,
+                        search = 'grid'
+                        )
+
+tune_grid <- expand.grid(.mtry = c(25))
+
+#rf_gridsearch_4 <- train(x = train_x_scaled,
+#                          y = as.factor(songs_tr$genre),
+#                          method = 'rf',
+#                          metric = "Accuracy",
+#                          tuneGrid = tune_grid,
+#                          trControl = control
+#                          )
+
+# saveRDS(rf_gridsearch_4, "rf_model_4.rds")
+rf_gridsearch_4 <- readRDS("rf_model_4.rds")
+
+# Summarising Model
+paste("The highest CV Accuracy for our fourth Random Forest model is", max(rf_gridsearch_4$results$Accuracy))
+rf_test_preds_4 <- predict(rf_gridsearch_4, test_x_scaled, type = "prob")
+rf_test_preds_4 <- colnames(rf_test_preds_4)[max.col(rf_test_preds_4)]
+
+```
+
+
+# Random Forest 5 (With expanded CV, Revised Feature Creation & Feature Selection)
+
+_Max CV Accuracy of 0.679_
+```{r randomforest_5, message=FALSE, warning=FALSE}
+# Training Model
+control <- trainControl(method = "cv",
+                        number = 5,
+                        search = 'grid'
+                        )
+tune_grid <- expand.grid(.mtry = c(18, 19, 20, 22, 25, 27, 30, 32))
+#rf_gridsearch_5 <- train(x = train_x_scaled,
+#                          y = as.factor(songs_tr$genre),
+#                          method = 'rf',
+#                          metric = "Accuracy",
+#                          tuneGrid = tune_grid,
+#                          trControl = control
+#                          )
+
+# saveRDS(rf_gridsearch_5, "rf_model_5.rds")
+
+rf_gridsearch_5 <- readRDS("rf_model_5.rds")
+
+# Summarising Model
+plot(rf_gridsearch_5)
+paste("The optimum number of randomly selected variables per tree is", rf_gridsearch_5$bestTune)
+paste("The highest CV Accuracy for our fifth Random Forest model is", max(rf_gridsearch_5$results$Accuracy))
+
+# Predicting out-of-sample
+rf_test_preds_5 <- predict(rf_gridsearch_5, test_x_scaled, type = "prob")
+rf_test_preds_5 <- colnames(rf_test_preds_5)[max.col(rf_test_preds_5)]
+
+```
+
+# Random Forest 6 (With expanded CV, Revised Feature Creation & Feature Selection)
+
+```{r randomforest_6, message=FALSE, warning=FALSE}
+# Training Model
+control <- trainControl(method = "cv",
+                        number = 5,
+                        search = 'grid'
+                        )
+
+tune_grid <- expand.grid(.mtry = c(20))
+
+# Grid Search
+# rf_gridsearch_6 <- train(x = train_x_scaled,
+#                          y = as.factor(songs_tr$genre),
+#                          method = 'rf',
+#                          metric = "Accuracy",
+#                          tuneGrid = tune_grid,
+#                          trControl = control
+#                          )
+
+# saveRDS(rf_gridsearch_6, "rf_model_6.rds")
+
+rf_gridsearch_6 <- readRDS("rf_model_6.rds")
+
+# Summarising Model
+paste("The optimum number of randomly selected variables per tree is", rf_gridsearch_6$bestTune)
+paste("The highest CV Accuracy for our seventh Random Forest model is", max(rf_gridsearch_6$results$Accuracy))
+
+# Predicting out-of-sample
+
+rf_test_preds_6 <- predict(rf_gridsearch_6, test_x_scaled, type = "prob")
+rf_test_preds_6 <- colnames(rf_test_preds_6)[max.col(rf_test_preds_6)]
+
+```
+
+
+# Gradient Boosting Machine w/ Random Search
+
+_CV Accuracy of 0.6772_
+```{r gradientboost,  message=FALSE, warning=FALSE}
+# Training Model
+
+control <- trainControl(method = "cv",
+                        number = 5,
+                        search = 'random'
+                        )
+
+# h2o.init()
+
+# Random Search
+# gbm_randomsearch <- train(x = train_x_scaled,
+#                         y = as.factor(songs_tr$genre),
+#                        method = 'gbm_h2o',
+#                        metric = "Accuracy",
+#                        tuneLength = 10,
+#                        trControl = control
+#                        )
+
+# saveRDS(gbm_randomsearch, "gbm_model_1.rds")
+
+gbm_randomsearch <- readRDS("gbm_model_1.rds")
+
+paste("The highest CV Accuracy for our Gradient Boosting Machine with Random Search is", max(gbm_randomsearch$results$Accuracy))
+
+# h2o.init()
+
+# Predict
+# gbm_test_preds_1 <- predict(gbm_randomsearch, test_x_scaled, type = "raw")
+
+# Writing File for Kaggle Submission
+# gbm_answers_1 <- cbind(songs_te$song_id, gbm_test_preds_1) %>%
+#  as.data.frame()
+# colnames(gbm_answers_1) <- c('song_id', 'genre')
+ 
+# gbm_answers_1$genre[gbm_answers_1$genre == 1] <- "hip hop"
+# gbm_answers_1$genre[gbm_answers_1$genre == 2] <- "pop"
+# gbm_answers_1$genre[gbm_answers_1$genre == 3] <- "rap"
+# gbm_answers_1$genre[gbm_answers_1$genre == 4] <- "rock"
+
+# write.csv(gbm_answers_1, 'gbm_answers_1.csv', row.names=FALSE)
+
+```
+
+
+# Neural Network
+
+__Used for Prediction with 1 Hidden layer (nnet).__
+
+_CV Error of 0.646._
+```{r neuralnetwork, message=FALSE, warning=FALSE}
+# Training Model
+control <- trainControl(method = "cv",
+                        number = 5,
+                        search = 'random'
+                        )
+
+# Random Search
+# nn_randomsearch <- train(x = train_x_scaled,
+#                        y = as.factor(songs_tr$genre),
+#                        method = 'nnet',
+#                        metric = "Accuracy",
+#                        tuneLength = 10,
+#                        trControl = control,
+#                        MaxNWts = 12500,
+#                        maxit=200
+#                        )
+
+# Best Model
+# max(nn_randomsearch$results$Accuracy, na.rm = TRUE)
+
+# nn_randomsearch$bestTune
+
+# Predict
+# nn_test_preds_1 <- predict(nn_randomsearch, test_x_scaled, type = "prob")
+
+# nn_test_preds_1 <- colnames(nn_test_preds_1)[max.col(nn_test_preds_1)]
+
+```
+
